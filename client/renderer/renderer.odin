@@ -9,8 +9,12 @@ import sdl3 "vendor:sdl3"
 // ================================================
 
 Renderer :: struct {
-    window:   ^sdl3.Window,
-    gpu:      ^sdl3.GPUDevice,
+    window: ^sdl3.Window,
+    gpu:    ^sdl3.GPUDevice,
+
+    // Current frame information
+    swapchain_width:  u32,
+    swapchain_height: u32,
 
     running: bool,
 }
@@ -94,8 +98,65 @@ Is_Running :: proc(r: ^Renderer) -> bool {
 // ================================================
 
 Draw :: proc(r: ^Renderer) {
-    // GPU rendering will be implemented here.
-    // For now, the window remains black.
+
+    // 1. Acquire GPU command buffer
+    cmd := sdl3.AcquireGPUCommandBuffer(r.gpu)
+
+    if cmd == nil {
+        fmt.println("Command buffer acquisition failed:", sdl3.GetError())
+        return
+    }
+
+    // 2. Acquire swapchain texture
+    swapchain_texture: ^sdl3.GPUTexture
+    width, height: u32
+
+    if !sdl3.WaitAndAcquireGPUSwapchainTexture( cmd, r.window, &swapchain_texture, &width, &height, ) {
+        
+        fmt.println("Swapchain acquisition failed:", sdl3.GetError())
+
+        // Submit the command buffer instead of cancelling it.
+        if !sdl3.SubmitGPUCommandBuffer(cmd) {
+            fmt.println("GPU submission failed:", sdl3.GetError())
+        }
+        return
+    }
+
+    // 3. Handle minimized window
+    if swapchain_texture == nil {
+        if !sdl3.SubmitGPUCommandBuffer(cmd) {
+            fmt.println("GPU submission failed:", sdl3.GetError())
+        }
+        return
+    }
+
+    // 4. Describe our color attachment
+    color_target := sdl3.GPUColorTargetInfo{
+        texture     = swapchain_texture,
+        load_op     = .CLEAR,
+        clear_color = sdl3.FColor([4]f32{0.08, 0.12, 0.20, 1.0}),
+        store_op    = .STORE,
+    }
+
+    // 5. Begin render pass
+    pass := sdl3.BeginGPURenderPass(
+        cmd,
+        &color_target,
+        1,
+        nil,
+    )
+
+    // No drawing commands yet.
+    // The render pass will simply clear the window.
+
+    // 6. End render pass
+    sdl3.EndGPURenderPass(pass)
+
+    // 7. Submit command buffer
+    if !sdl3.SubmitGPUCommandBuffer(cmd) {
+        fmt.println("GPU submission failed:", sdl3.GetError())
+        return
+    }
 }
 
 // ================================================
@@ -116,4 +177,56 @@ Shutdown :: proc(r: ^Renderer) {
     sdl3.Quit()
 
     fmt.println("Renderer shutdown.")
+}
+
+
+
+Acquire_Swapchain :: proc(r: ^Renderer) -> bool {
+
+    // Get a GPU command buffer
+    cmd := sdl3.AcquireGPUCommandBuffer(r.gpu)
+
+    if cmd == nil {
+        fmt.println("Command buffer acquisition failed:", sdl3.GetError())
+        return false
+    }
+
+    // Get the next available swapchain texture
+    swapchain_texture: ^sdl3.GPUTexture
+
+    if !sdl3.WaitAndAcquireGPUSwapchainTexture(
+        cmd,
+        r.window,
+        &swapchain_texture,
+        &r.swapchain_width,
+        &r.swapchain_height,
+    ) {
+        fmt.println("Swapchain acquisition failed:", sdl3.GetError())
+        if !sdl3.CancelGPUCommandBuffer(cmd) {
+            fmt.println("Command buffer cancellation failed:", sdl3.GetError())
+        }
+        return false
+    }
+
+    // A nil texture can happen when the window is minimized.
+    if swapchain_texture == nil {
+        if !sdl3.CancelGPUCommandBuffer(cmd) {
+            fmt.println("Command buffer cancellation failed:", sdl3.GetError())
+        }
+        return true
+    }
+
+    fmt.println(
+        "Swapchain acquired:",
+        r.swapchain_width,
+        "x",
+        r.swapchain_height,
+    )
+
+    // We'll add the render pass and submit the command buffer next.
+    if !sdl3.CancelGPUCommandBuffer(cmd) {
+            fmt.println("Command buffer cancellation failed:", sdl3.GetError())
+        }
+
+    return true
 }
