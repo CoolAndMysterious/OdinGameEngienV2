@@ -1,28 +1,20 @@
 package main
 
 import "core:fmt"
-import "renderer"
+import r "renderer"
 import ecs "ECS"
-import sdl3 "vendor:sdl3"
-
 
 main :: proc() {
 
-    // Create renderer
-    r: renderer.Renderer
+    fmt.print("Starting Game Client")
 
-    // Initialize
-    if !renderer.Init(&r) {
-        return
-    }
+    rl.InitWindow(1280, 720, "RayLib Engine")
+    rl.DisableCursor()
+    defer rl.CloseWindow()
 
-    defer renderer.Shutdown(&r)
+    for !rl.WindowShouldClose(){
 
-    // Main loop
-    for renderer.Is_Running(&r) {
 
-        renderer.Update(&r)
-
-        renderer.Draw(&r)
+        r.RLrender()
     }
 }
