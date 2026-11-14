@@ -1,0 +1,1085 @@
+package main
+
+import "core:fmt"
+import "core:math"
+import "core:time"
+
+import ecs "../Client/ECS"
+
+// ============================================================
+// ECS STRESS / CORRECTNESS TEST
+// ============================================================
+//
+// Tests:
+// 1. Large-scale entity creation and automatic capacity growth.
+// 2. Tag insertion and tag lookup.
+// 3. Direct-index component writes and reads.
+// 4. Destruction and dead-slot data retention.
+// 5. Free-list LIFO reuse.
+// 6. Partial reuse while retaining dead slots.
+// 7. Repeated destroy/reuse churn.
+// 8. Multi-pass simulation over alive entities only.
+// 9. ECS storage and free-list invariants.
+// 10. Save/load round-trip into a differently-sized world.
+//
+// Run this file from the project directory so the import path
+// "../Client/ECS" resolves in the same way as the supplied tests.
+//
+// The save/load stage uses the ECS package's configured SAVE_PATH.
+// Make sure its parent directory exists before running.
+//
+// This is intentionally a heavy test. Start with ENTITY_COUNT =
+// 100_000 if you want a shorter first run.
+
+ENTITY_COUNT :: 1_000_000
+EXTRA_ENTITY_COUNT :: 250_000
+
+SIMULATION_STEPS :: 12
+CHURN_ROUNDS :: 3
+
+DT :: f32(1.0 / 60.0)
+
+INITIAL_CAPACITY :: 1024
+
+main :: proc() {
+    passed := true
+
+    fmt.println()
+    fmt.println("============================================================")
+    fmt.println("                 ECS EXTREME STRESS TEST")
+    fmt.println("============================================================")
+    fmt.println()
+    fmt.println("Initial entities :", ENTITY_COUNT)
+    fmt.println("Extra entities   :", EXTRA_ENTITY_COUNT)
+    fmt.println("Simulation steps :", SIMULATION_STEPS)
+    fmt.println("Churn rounds     :", CHURN_ROUNDS)
+    fmt.println("Initial capacity :", INITIAL_CAPACITY)
+    fmt.println()
+
+    // ========================================================
+    // CREATE WORLD
+    // ========================================================
+
+    fmt.println("[1/10] Creating ECS world...")
+
+    world := ecs.create_world(INITIAL_CAPACITY)
+    defer ecs.destroy_world(&world)
+
+    fmt.println("World created.")
+    fmt.println("Capacity:", world.entity_capacity)
+    fmt.println()
+
+    // Keep the IDs returned by create_entity so we can verify
+    // that direct indexing remains stable.
+    entities: [dynamic]ecs.Entity
+    reserve(&entities, ENTITY_COUNT + EXTRA_ENTITY_COUNT)
+    defer delete(entities)
+
+    // ========================================================
+    // LARGE-SCALE ENTITY CREATION
+    // ========================================================
+
+    fmt.println("[2/10] Creating initial entity population...")
+
+    start := time.tick_now()
+
+    for i in 0 ..< ENTITY_COUNT {
+        entity := ecs.create_entity(&world)
+        append(&entities, entity)
+
+        id := int(entity)
+
+        // Every entity is an object.
+        ecs.add_tag(&world, entity, .Object)
+
+        // Distribute entity roles.
+        if i % 6 == 0 {
+            ecs.add_tag(&world, entity, .Player)
+            ecs.add_tag(&world, entity, .Human)
+
+        } else if i % 6 == 1 {
+            ecs.add_tag(&world, entity, .Monster)
+            ecs.add_tag(&world, entity, .AI)
+
+        } else if i % 6 == 2 {
+            ecs.add_tag(&world, entity, .Human)
+
+        } else if i % 6 == 3 {
+            ecs.add_tag(&world, entity, .AI)
+
+        } else if i % 6 == 4 {
+            ecs.add_tag(&world, entity, .Particle)
+        }
+
+        // Unique, deterministic component data.
+        world.positions[id] = ecs.Position{
+            x = f32(i % 1000) * 0.25,
+            y = f32((i / 1000) % 1000) * 0.25,
+            z = f32(i / 1_000_000) * 0.25,
+        }
+
+        world.rotations[id] = ecs.Rotation{
+            x = f32(i % 31) * 0.01,
+            y = f32(i % 47) * 0.02,
+            z = f32(i % 61) * 0.03,
+            w = 1.0,
+        }
+
+        world.velocities[id] = ecs.Velocity{
+            x = f32(i % 17 - 8) * 0.1,
+            y = f32(i % 11 - 5) * 0.1,
+            z = f32(i % 23 - 11) * 0.1,
+        }
+
+        // The first population should receive monotonically
+        // increasing IDs because the free list is initially empty.
+        if id != i {
+            fmt.println("FAIL: unexpected entity ID during initial creation.")
+            fmt.println("Expected:", i, "Got:", id)
+            passed = false
+        }
+    }
+
+    elapsed := time.tick_since(start)
+
+    fmt.println(
+        "Creation time:",
+        time.duration_milliseconds(elapsed),
+        "ms",
+    )
+    fmt.println("Capacity after creation:", world.entity_capacity)
+    fmt.println("Next entity:", world.next_entity)
+    fmt.println()
+
+    if len(world.entity_state) != world.entity_capacity ||
+       len(world.tags) != world.entity_capacity ||
+       len(world.positions) != world.entity_capacity ||
+       len(world.rotations) != world.entity_capacity ||
+       len(world.velocities) != world.entity_capacity {
+        fmt.println("FAIL: ECS arrays do not match entity_capacity.")
+        passed = false
+    } else {
+        fmt.println("PASS: all ECS arrays have matching capacity.")
+    }
+
+    if int(world.next_entity) != ENTITY_COUNT {
+        fmt.println("FAIL: next_entity after initial creation.")
+        fmt.println("Expected:", ENTITY_COUNT)
+        fmt.println("Got:", world.next_entity)
+        passed = false
+    } else {
+        fmt.println("PASS: next_entity after initial creation.")
+    }
+
+    // ========================================================
+    // INITIAL TAG AND COMPONENT VALIDATION
+    // ========================================================
+
+    fmt.println()
+    fmt.println("[3/10] Validating initial entity data...")
+
+    initial_validation_ok := true
+
+    for i in 0 ..< ENTITY_COUNT {
+        entity := entities[i]
+        id := int(entity)
+
+        if world.entity_state[id] != .Alive {
+            fmt.println("FAIL: newly-created entity is not alive:", id)
+            initial_validation_ok = false
+            break
+        }
+
+        if !ecs.has_tag(&world, entity, .Object) {
+            fmt.println("FAIL: Object tag missing:", id)
+            initial_validation_ok = false
+            break
+        }
+
+        if i % 6 == 0 {
+            if !ecs.has_tag(&world, entity, .Player) ||
+               !ecs.has_tag(&world, entity, .Human) {
+                fmt.println("FAIL: Player/Human tags:", id)
+                initial_validation_ok = false
+                break
+            }
+        } else if i % 6 == 1 {
+            if !ecs.has_tag(&world, entity, .Monster) ||
+               !ecs.has_tag(&world, entity, .AI) {
+                fmt.println("FAIL: Monster/AI tags:", id)
+                initial_validation_ok = false
+                break
+            }
+        } else if i % 6 == 2 {
+            if !ecs.has_tag(&world, entity, .Human) {
+                fmt.println("FAIL: Human tag:", id)
+                initial_validation_ok = false
+                break
+            }
+        } else if i % 6 == 3 {
+            if !ecs.has_tag(&world, entity, .AI) {
+                fmt.println("FAIL: AI tag:", id)
+                initial_validation_ok = false
+                break
+            }
+        } else if i % 6 == 4 {
+            if !ecs.has_tag(&world, entity, .Particle) {
+                fmt.println("FAIL: Particle tag:", id)
+                initial_validation_ok = false
+                break
+            }
+        }
+
+        expected_x := f32(i % 1000) * 0.25
+        expected_y := f32((i / 1000) % 1000) * 0.25
+        expected_z := f32(i / 1_000_000) * 0.25
+
+        if world.positions[id].x != expected_x ||
+           world.positions[id].y != expected_y ||
+           world.positions[id].z != expected_z {
+            fmt.println("FAIL: initial position mismatch:", id)
+            initial_validation_ok = false
+            break
+        }
+
+        if world.rotations[id].w != 1.0 {
+            fmt.println("FAIL: initial rotation mismatch:", id)
+            initial_validation_ok = false
+            break
+        }
+    }
+
+    if initial_validation_ok {
+        fmt.println("PASS: initial entity states, tags and components.")
+    } else {
+        passed = false
+    }
+
+    // ========================================================
+    // DESTROY A LARGE SUBSET
+    // ========================================================
+
+    fmt.println()
+    fmt.println("[4/10] Destroying every fifth initial entity...")
+
+    destroyed_count := 0
+
+    start = time.tick_now()
+
+    for i in 0 ..< ENTITY_COUNT {
+        if i % 5 == 0 {
+            entity := entities[i]
+            id := int(entity)
+
+            // Write distinctive values before destruction.
+            // Your ECS intentionally retains component bytes
+            // after an entity becomes dead.
+            world.positions[id] = ecs.Position{
+                x = 1111.0 + f32(i),
+                y = 2222.0 + f32(i),
+                z = 3333.0 + f32(i),
+            }
+
+            world.rotations[id] = ecs.Rotation{
+                x = 4444.0 + f32(i),
+                y = 5555.0 + f32(i),
+                z = 6666.0 + f32(i),
+                w = 7777.0 + f32(i),
+            }
+
+            world.velocities[id] = ecs.Velocity{
+                x = 8888.0 + f32(i),
+                y = 9999.0 + f32(i),
+                z = 11111.0 + f32(i),
+            }
+
+            ecs.destroy_entity(&world, entity)
+            destroyed_count += 1
+
+            if world.entity_state[id] != .Dead {
+                fmt.println("FAIL: destroyed entity not marked Dead:", id)
+                passed = false
+                break
+            }
+
+            if card(world.tags[id]) != 0 {
+                fmt.println("FAIL: destroyed entity still has tags:", id)
+                passed = false
+                break
+            }
+
+            // Check that component bytes were retained.
+            if world.positions[id].x != 1111.0 + f32(i) ||
+               world.rotations[id].w != 7777.0 + f32(i) ||
+               world.velocities[id].z != 11111.0 + f32(i) {
+                fmt.println("FAIL: dead-slot component data was modified:", id)
+                passed = false
+                break
+            }
+        }
+    }
+
+    elapsed = time.tick_since(start)
+
+    fmt.println(
+        "Destroy time:",
+        time.duration_milliseconds(elapsed),
+        "ms",
+    )
+    fmt.println("Destroyed:", destroyed_count)
+    fmt.println("Free-list length:", len(world.free_entities))
+
+    if len(world.free_entities) == destroyed_count {
+        fmt.println("PASS: free-list count after destruction.")
+    } else {
+        fmt.println("FAIL: free-list count does not match destroyed count.")
+        passed = false
+    }
+
+    // ========================================================
+    // PARTIAL FREE-LIST REUSE
+    // ========================================================
+
+    fmt.println()
+    fmt.println("[5/10] Reusing half of the dead entity slots...")
+
+    reuse_count := len(world.free_entities) / 2
+    reuse_ok := true
+
+    start = time.tick_now()
+
+    for i in 0 ..< reuse_count {
+        // The free list is a stack. create_entity() should reuse
+        // the final ID in the list first.
+        expected_entity := world.free_entities[len(world.free_entities) - 1]
+        expected_id := int(expected_entity)
+
+        // Verify that stale data is still present before reuse.
+        old_position_x := world.positions[expected_id].x
+
+        entity := ecs.create_entity(&world)
+        id := int(entity)
+
+        if entity != expected_entity {
+            fmt.println("FAIL: free-list LIFO reuse order.")
+            fmt.println("Expected:", expected_entity, "Got:", entity)
+            reuse_ok = false
+            break
+        }
+
+        if id != expected_id {
+            fmt.println("FAIL: reused entity index mismatch.")
+            reuse_ok = false
+            break
+        }
+
+        if world.entity_state[id] != .Alive {
+            fmt.println("FAIL: reused entity not marked Alive:", id)
+            reuse_ok = false
+            break
+        }
+
+        // create_entity should reset tags, but retained component
+        // bytes are intentionally not cleared by this ECS design.
+        if card(world.tags[id]) != 0 {
+            fmt.println("FAIL: reused entity retained old tags:", id)
+            reuse_ok = false
+            break
+        }
+
+        if world.positions[id].x != old_position_x {
+            fmt.println("FAIL: create_entity unexpectedly changed component data:", id)
+            reuse_ok = false
+            break
+        }
+
+        // Explicitly initialize the reused entity.
+        ecs.add_tag(&world, entity, .Object)
+        ecs.add_tag(&world, entity, .Particle)
+
+        world.positions[id] = ecs.Position{
+            x = f32(i) * 0.01,
+            y = 10.0,
+            z = -f32(i) * 0.01,
+        }
+
+        world.rotations[id] = ecs.Rotation{
+            x = 0,
+            y = 0,
+            z = 0,
+            w = 1,
+        }
+
+        world.velocities[id] = ecs.Velocity{
+            x = 0.1,
+            y = 0.2,
+            z = 0.3,
+        }
+    }
+
+    elapsed = time.tick_since(start)
+
+    fmt.println(
+        "Reuse time:",
+        time.duration_milliseconds(elapsed),
+        "ms",
+    )
+
+    if reuse_ok {
+        fmt.println("PASS: free-list LIFO reuse and stale-data policy.")
+    } else {
+        passed = false
+    }
+
+    fmt.println("Remaining free IDs:", len(world.free_entities))
+
+    // ========================================================
+    // CREATE ADDITIONAL ENTITIES TO FORCE MORE GROWTH
+    // ========================================================
+
+    fmt.println()
+    fmt.println("[6/10] Creating additional entities...")
+
+    free_ids_before_extra := len(world.free_entities)
+
+    start = time.tick_now()
+
+    for i in 0 ..< EXTRA_ENTITY_COUNT {
+        entity := ecs.create_entity(&world)
+        id := int(entity)
+
+        ecs.add_tag(&world, entity, .Object)
+
+        if i % 3 == 0 {
+            ecs.add_tag(&world, entity, .AI)
+        } else if i % 3 == 1 {
+            ecs.add_tag(&world, entity, .Human)
+        } else {
+            ecs.add_tag(&world, entity, .Particle)
+        }
+
+        world.positions[id] = ecs.Position{
+            x = f32(i % 10000) * 0.1,
+            y = f32(i / 10000) * 0.1,
+            z = -f32(i % 997) * 0.1,
+        }
+
+        world.rotations[id] = ecs.Rotation{
+            x = 0.01 * f32(i % 7),
+            y = 0.02 * f32(i % 11),
+            z = 0.03 * f32(i % 13),
+            w = 1.0,
+        }
+
+        world.velocities[id] = ecs.Velocity{
+            x = f32(i % 19) * 0.01,
+            y = f32(i % 23) * 0.01,
+            z = f32(i % 29) * 0.01,
+        }
+    }
+
+    elapsed = time.tick_since(start)
+
+    fmt.println(
+        "Additional creation time:",
+        time.duration_milliseconds(elapsed),
+        "ms",
+    )
+    fmt.println("Entity capacity:", world.entity_capacity)
+    fmt.println("Next entity:", world.next_entity)
+    fmt.println("Total IDs ever allocated:", int(world.next_entity))
+
+    // The first EXTRA_ENTITY_COUNT creations consume the remaining
+    // free-list entries before allocating any new IDs.
+    expected_next_entity :=
+        ENTITY_COUNT + EXTRA_ENTITY_COUNT - free_ids_before_extra
+
+    if int(world.next_entity) != expected_next_entity {
+        fmt.println("FAIL: next_entity after additional creation.")
+        fmt.println("Expected:", expected_next_entity)
+        fmt.println("Got:", world.next_entity)
+        passed = false
+    } else {
+        fmt.println("PASS: additional entity allocation and free-list priority.")
+    }
+
+    // ========================================================
+    // REPEATED DESTROY / REUSE CHURN
+    // ========================================================
+
+    fmt.println()
+    fmt.println("[7/10] Running repeated destroy/reuse churn...")
+
+    churn_ok := true
+
+    for round in 0 ..< CHURN_ROUNDS {
+        destroyed_this_round := 0
+
+        // Destroy a deterministic subset of currently-alive IDs.
+        for id in 0 ..< int(world.next_entity) {
+            entity := ecs.Entity(id)
+
+            if world.entity_state[id] == .Alive && id % 31 == round {
+                ecs.destroy_entity(&world, entity)
+                destroyed_this_round += 1
+            }
+        }
+
+        // Recreate exactly the number destroyed. This should
+        // consume the newly-pushed free-list entries.
+        for i in 0 ..< destroyed_this_round {
+            if len(world.free_entities) == 0 {
+                fmt.println("FAIL: free list unexpectedly empty during churn.")
+                churn_ok = false
+                break
+            }
+
+            expected_entity := world.free_entities[len(world.free_entities) - 1]
+            entity := ecs.create_entity(&world)
+
+            if entity != expected_entity {
+                fmt.println("FAIL: churn reuse returned unexpected entity ID.")
+                churn_ok = false
+                break
+            }
+
+            id := int(entity)
+
+            ecs.add_tag(&world, entity, .Object)
+            if (i + round) % 2 == 0 {
+                ecs.add_tag(&world, entity, .Particle)
+            } else {
+                ecs.add_tag(&world, entity, .AI)
+            }
+
+            world.positions[id] = ecs.Position{
+                x = f32(id) * 0.001,
+                y = f32(round),
+                z = -f32(i) * 0.001,
+            }
+
+            world.rotations[id] = ecs.Rotation{
+                x = 0,
+                y = f32(round) * 0.1,
+                z = 0,
+                w = 1,
+            }
+
+            world.velocities[id] = ecs.Velocity{
+                x = 0.01 * f32(round + 1),
+                y = 0,
+                z = 0.02 * f32(i % 5),
+            }
+        }
+
+        fmt.println(
+            "Churn round",
+            round + 1,
+            "destroyed/reused:",
+            destroyed_this_round,
+        )
+
+        if !churn_ok {
+            break
+        }
+    }
+
+    if churn_ok {
+        fmt.println("PASS: repeated destroy/reuse churn.")
+    } else {
+        passed = false
+    }
+
+    // Leave a deterministic set of dead slots in the final world.
+    // This ensures the simulation and save/load tests both exercise
+    // dead entities that remain allocated in the ECS arrays.
+    final_dead_count := 0
+
+    for id in 0 ..< int(world.next_entity) {
+        entity := ecs.Entity(id)
+
+        if world.entity_state[id] == .Alive && id % 97 == 0 {
+            ecs.destroy_entity(&world, entity)
+            final_dead_count += 1
+        }
+    }
+
+    fmt.println("Final dead slots retained for later tests:", final_dead_count)
+
+    // ========================================================
+    // MULTI-PASS SIMULATION
+    // ========================================================
+
+    fmt.println()
+    fmt.println("[8/10] Running simulation passes...")
+    fmt.println("Alive entities are simulated; dead slots are skipped.")
+
+    start = time.tick_now()
+
+    total_checksum: f64 = 0
+    simulated_entity_steps: u64 = 0
+
+    for step in 0 ..< SIMULATION_STEPS {
+        simulation_time := f32(step) * DT
+        step_checksum: f64 = 0
+
+        for id in 0 ..< int(world.next_entity) {
+            if world.entity_state[id] != .Alive {
+                continue
+            }
+
+            entity := ecs.Entity(id)
+
+            px := world.positions[id].x
+            py := world.positions[id].y
+            pz := world.positions[id].z
+
+            vx := world.velocities[id].x
+            vy := world.velocities[id].y
+            vz := world.velocities[id].z
+
+            // Gravity and drag.
+            vy -= 9.81 * DT
+
+            speed_squared :=
+                vx * vx +
+                vy * vy +
+                vz * vz
+
+            drag := 1.0 / (1.0 + speed_squared * 0.002)
+
+            vx *= drag
+            vy *= drag
+            vz *= drag
+
+            // Deterministic environmental forces.
+            force_x := math.sin(px * 0.01 + simulation_time)
+            force_y := math.cos(py * 0.013 + simulation_time * 1.7)
+            force_z := math.sin(pz * 0.017 + simulation_time * 0.7)
+
+            vx += force_x * DT
+            vy += force_y * DT
+            vz += force_z * DT
+
+            // AI steering.
+            if ecs.has_tag(&world, entity, .AI) {
+                threat := math.sin(px * 0.021) * math.cos(pz * 0.017)
+                aggression := math.sin(simulation_time * 2.0 + py * 0.01)
+                decision := threat * 0.6 + aggression * 0.4
+
+                if decision > 0.25 {
+                    vx += math.sin(px * 0.05) * DT
+                    vz += math.cos(pz * 0.05) * DT
+                } else {
+                    vx *= 0.999
+                    vz *= 0.999
+                }
+            }
+
+            // Player steering.
+            if ecs.has_tag(&world, entity, .Player) {
+                target_x := math.sin(simulation_time * 0.5) * 500.0
+                target_y := math.cos(simulation_time * 0.7) * 300.0
+                target_z := math.sin(simulation_time * 0.3) * 400.0
+
+                dx := target_x - px
+                dy := target_y - py
+                dz := target_z - pz
+
+                distance_squared := dx * dx + dy * dy + dz * dz
+
+                if distance_squared > 0.001 {
+                    inv_distance := 1.0 / math.sqrt(distance_squared)
+                    vx += dx * inv_distance * 0.25 * DT
+                    vy += dy * inv_distance * 0.25 * DT
+                    vz += dz * inv_distance * 0.25 * DT
+                }
+            }
+
+            // Human idle animation.
+            if ecs.has_tag(&world, entity, .Human) {
+                py += math.sin(
+                    simulation_time * 3.0 + f32(id) * 0.001,
+                ) * 0.01
+            }
+
+            // Integrate position.
+            px += vx * DT
+            py += vy * DT
+            pz += vz * DT
+
+            // Keep the test world bounded.
+            if px > 2000.0 { px = -2000.0 }
+            if px < -2000.0 { px = 2000.0 }
+            if py > 2000.0 { py = -2000.0 }
+            if py < -2000.0 { py = 2000.0 }
+            if pz > 2000.0 { pz = -2000.0 }
+            if pz < -2000.0 { pz = 2000.0 }
+
+            // Orientation from horizontal velocity.
+            horizontal_speed := math.sqrt(vx * vx + vz * vz)
+            if horizontal_speed > 0.001 {
+                world.rotations[id].y = math.atan2(vx, vz)
+            }
+
+            world.rotations[id].x =
+                math.sin(simulation_time + f32(id) * 0.0001) * 0.1
+
+            world.rotations[id].z =
+                math.cos(simulation_time * 0.7 + f32(id) * 0.0001) * 0.1
+
+            // Write components back.
+            world.positions[id] = ecs.Position{px, py, pz}
+            world.velocities[id] = ecs.Velocity{vx, vy, vz}
+
+            // Read back all component groups and calculate
+            // a checksum so the simulation has observable output.
+            distance := math.sqrt(px * px + py * py + pz * pz)
+
+            kinetic := 0.5 * (vx * vx + vy * vy + vz * vz)
+
+            rotation_energy :=
+                world.rotations[id].x * world.rotations[id].x +
+                world.rotations[id].y * world.rotations[id].y +
+                world.rotations[id].z * world.rotations[id].z
+
+            value :=
+                math.sin(distance * 0.001) *
+                math.cos(kinetic * 0.01) +
+                rotation_energy * 0.1
+
+            step_checksum += f64(value)
+            simulated_entity_steps += 1
+        }
+
+        total_checksum += step_checksum
+
+        if step % 3 == 0 {
+            fmt.println("Step", step + 1, "checksum:", step_checksum)
+        }
+    }
+
+    elapsed = time.tick_since(start)
+
+    fmt.println(
+        "Simulation time:",
+        time.duration_milliseconds(elapsed),
+        "ms",
+    )
+    fmt.println("Simulated entity-steps:", simulated_entity_steps)
+    fmt.println("Total checksum:", total_checksum)
+
+    // ========================================================
+    // STORAGE / FREE-LIST INVARIANTS
+    // ========================================================
+
+    fmt.println()
+    fmt.println("[9/10] Checking ECS invariants...")
+
+    invariant_ok := true
+
+    capacity := world.entity_capacity
+    allocated_count := int(world.next_entity)
+
+    if len(world.entity_state) != capacity ||
+       len(world.tags) != capacity ||
+       len(world.positions) != capacity ||
+       len(world.rotations) != capacity ||
+       len(world.velocities) != capacity {
+        fmt.println("FAIL: ECS array lengths differ from capacity.")
+        invariant_ok = false
+    }
+
+    if allocated_count > capacity {
+        fmt.println("FAIL: next_entity exceeds capacity.")
+        invariant_ok = false
+    }
+
+    free_seen := make([]bool, allocated_count)
+    defer delete(free_seen)
+
+    // Every free-list ID must be valid, dead and unique.
+    for entity in world.free_entities {
+        id := int(entity)
+
+        if id < 0 || id >= allocated_count {
+            fmt.println("FAIL: free-list ID out of range:", id)
+            invariant_ok = false
+            break
+        }
+
+        if free_seen[id] {
+            fmt.println("FAIL: duplicate free-list ID:", id)
+            invariant_ok = false
+            break
+        }
+
+        free_seen[id] = true
+
+        if world.entity_state[id] != .Dead {
+            fmt.println("FAIL: free-list entity is not Dead:", id)
+            invariant_ok = false
+            break
+        }
+
+        if card(world.tags[id]) != 0 {
+            fmt.println("FAIL: dead entity has tags:", id)
+            invariant_ok = false
+            break
+        }
+    }
+
+    alive_count := 0
+    dead_count := 0
+    player_count := 0
+    ai_count := 0
+    human_count := 0
+    particle_count := 0
+
+    for id in 0 ..< allocated_count {
+        entity := ecs.Entity(id)
+
+        if world.entity_state[id] == .Alive {
+            alive_count += 1
+
+            if free_seen[id] {
+                fmt.println("FAIL: alive entity appears in free list:", id)
+                invariant_ok = false
+                break
+            }
+
+            if ecs.has_tag(&world, entity, .Player) {
+                player_count += 1
+            }
+
+            if ecs.has_tag(&world, entity, .AI) {
+                ai_count += 1
+            }
+
+            if ecs.has_tag(&world, entity, .Human) {
+                human_count += 1
+            }
+
+            if ecs.has_tag(&world, entity, .Particle) {
+                particle_count += 1
+            }
+
+        } else if world.entity_state[id] == .Dead {
+            dead_count += 1
+
+            if !free_seen[id] {
+                fmt.println("FAIL: dead entity missing from free list:", id)
+                invariant_ok = false
+                break
+            }
+
+            if card(world.tags[id]) != 0 {
+                fmt.println("FAIL: dead entity has non-empty tags:", id)
+                invariant_ok = false
+                break
+            }
+
+        } else {
+            fmt.println("FAIL: invalid entity state:", id)
+            invariant_ok = false
+            break
+        }
+    }
+
+    if dead_count != len(world.free_entities) {
+        fmt.println("FAIL: dead count differs from free-list count.")
+        invariant_ok = false
+    }
+
+    if invariant_ok {
+        fmt.println("PASS: storage lengths and free-list invariants.")
+    } else {
+        passed = false
+    }
+
+    fmt.println("Allocated IDs:", allocated_count)
+    fmt.println("Alive:", alive_count)
+    fmt.println("Dead:", dead_count)
+    fmt.println("Free list:", len(world.free_entities))
+    fmt.println("Players:", player_count)
+    fmt.println("AI:", ai_count)
+    fmt.println("Humans:", human_count)
+    fmt.println("Particles:", particle_count)
+
+    // ========================================================
+    // SAVE / LOAD ROUND-TRIP
+    // ========================================================
+
+    fmt.println()
+    fmt.println("[10/10] Testing save/load round-trip...")
+
+    save_ok := ecs.save_world(&world)
+
+    if !save_ok {
+        fmt.println("FAIL: save_world returned false.")
+        fmt.println("Check that the configured save directory exists.")
+        passed = false
+    } else {
+        fmt.println("PASS: save_world.")
+
+        // Load into a deliberately tiny world. load_world should
+        // resize its storage to match the saved ECS world.
+        loaded_world := ecs.create_world(8)
+        defer ecs.destroy_world(&loaded_world)
+
+        load_ok := ecs.load_world(&loaded_world)
+
+        if !load_ok {
+            fmt.println("FAIL: load_world returned false.")
+            passed = false
+        } else {
+            fmt.println("PASS: load_world.")
+
+            round_trip_ok := true
+
+            if loaded_world.entity_capacity != world.entity_capacity {
+                fmt.println("FAIL: loaded entity_capacity.")
+                round_trip_ok = false
+            }
+
+            if loaded_world.next_entity != world.next_entity {
+                fmt.println("FAIL: loaded next_entity.")
+                round_trip_ok = false
+            }
+
+            if len(loaded_world.free_entities) != len(world.free_entities) {
+                fmt.println("FAIL: loaded free-list length.")
+                round_trip_ok = false
+            }
+
+            if len(loaded_world.entity_state) != len(world.entity_state) ||
+               len(loaded_world.tags) != len(world.tags) ||
+               len(loaded_world.positions) != len(world.positions) ||
+               len(loaded_world.rotations) != len(world.rotations) ||
+               len(loaded_world.velocities) != len(world.velocities) {
+                fmt.println("FAIL: loaded component array lengths.")
+                round_trip_ok = false
+            }
+
+            if round_trip_ok {
+                // Compare the complete entity-indexed storage,
+                // including unused capacity and dead-slot bytes.
+                for id in 0 ..< world.entity_capacity {
+                    if loaded_world.entity_state[id] != world.entity_state[id] {
+                        fmt.println("FAIL: entity_state round-trip:", id)
+                        round_trip_ok = false
+                        break
+                    }
+
+                    for tag in ecs.Tag {
+                        if (tag in loaded_world.tags[id]) != (tag in world.tags[id]) {
+                            fmt.println("FAIL: tag round-trip:", id, tag)
+                            round_trip_ok = false
+                            break
+                        }
+                    }
+
+                    if !round_trip_ok {
+                        break
+                    }
+
+                    if loaded_world.positions[id].x != world.positions[id].x ||
+                       loaded_world.positions[id].y != world.positions[id].y ||
+                       loaded_world.positions[id].z != world.positions[id].z {
+                        fmt.println("FAIL: position round-trip:", id)
+                        round_trip_ok = false
+                        break
+                    }
+
+                    if loaded_world.rotations[id].x != world.rotations[id].x ||
+                       loaded_world.rotations[id].y != world.rotations[id].y ||
+                       loaded_world.rotations[id].z != world.rotations[id].z ||
+                       loaded_world.rotations[id].w != world.rotations[id].w {
+                        fmt.println("FAIL: rotation round-trip:", id)
+                        round_trip_ok = false
+                        break
+                    }
+
+                    if loaded_world.velocities[id].x != world.velocities[id].x ||
+                       loaded_world.velocities[id].y != world.velocities[id].y ||
+                       loaded_world.velocities[id].z != world.velocities[id].z {
+                        fmt.println("FAIL: velocity round-trip:", id)
+                        round_trip_ok = false
+                        break
+                    }
+                }
+            }
+
+            if round_trip_ok {
+                // The free-list order is significant because
+                // create_entity pops from its end.
+                for i in 0 ..< len(world.free_entities) {
+                    if loaded_world.free_entities[i] != world.free_entities[i] {
+                        fmt.println("FAIL: free-list order round-trip:", i)
+                        round_trip_ok = false
+                        break
+                    }
+                }
+            }
+
+            if round_trip_ok {
+                fmt.println("PASS: complete ECS save/load round-trip.")
+                fmt.println("PASS: dead-slot component bytes preserved.")
+                fmt.println("PASS: free-list order preserved.")
+
+                // Verify that the loaded free list still works.
+                if len(loaded_world.free_entities) > 0 {
+                    expected_entity :=
+                        loaded_world.free_entities[len(loaded_world.free_entities) - 1]
+
+                    reused_entity := ecs.create_entity(&loaded_world)
+
+                    if reused_entity != expected_entity {
+                        fmt.println("FAIL: loaded free-list reuse.")
+                        round_trip_ok = false
+                    } else {
+                        fmt.println("PASS: entity reuse after loading.")
+                    }
+                }
+            }
+
+            if !round_trip_ok {
+                passed = false
+            }
+        }
+    }
+
+    // ========================================================
+    // FINAL REPORT
+    // ========================================================
+
+    fmt.println()
+    fmt.println("============================================================")
+    fmt.println("                    FINAL TEST REPORT")
+    fmt.println("============================================================")
+    fmt.println()
+    fmt.println("Initial entities       :", ENTITY_COUNT)
+    fmt.println("Additional entities    :", EXTRA_ENTITY_COUNT)
+    fmt.println("Allocated entity IDs   :", int(world.next_entity))
+    fmt.println("Entity capacity        :", world.entity_capacity)
+    fmt.println("Alive entities         :", alive_count)
+    fmt.println("Dead entities          :", dead_count)
+    fmt.println("Free-list entries      :", len(world.free_entities))
+    fmt.println("Simulation steps       :", SIMULATION_STEPS)
+    fmt.println("Simulation entity-steps:", simulated_entity_steps)
+    fmt.println("Simulation checksum    :", total_checksum)
+    fmt.println()
+
+    if passed {
+        fmt.println("             ECS STRESS TEST PASSED")
+    } else {
+        fmt.println("             ECS STRESS TEST FAILED")
+    }
+
+    fmt.println("============================================================")
+    fmt.println()
+
+    for{
+        continue
+    }
+}

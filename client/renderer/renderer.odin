@@ -6,12 +6,24 @@ import rl "vendor:raylib"
 
 
 camera := rl.Camera3D{
-        position   = { 0, 2, 6 },
-        target     = { 0, 1, 0 },
-        up         = { 0, 1, 0 },
-        fovy       = 45,
-        projection = .PERSPECTIVE,
+    position   = {0, 2, 6},
+    target     = {0, 1, 0},
+    up         = {0, 1, 0},
+    fovy       = 60,
+    projection = .PERSPECTIVE,
 }
+
+
+
+
+Init :: proc() {
+
+}
+
+Shutdown :: proc() {
+}
+
+
 
 
 RLrender :: proc() {
