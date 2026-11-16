@@ -1,50 +1,26 @@
 package ECS
 
-World :: struct {
-    ECS: ECS,
-    PCS: PCS,
-    FCS: FCS,
-    LCS: LCS,
-}
+
 ECS :: struct {
-    Entity: Entity_Manager,
-    tags: [dynamic]Tag_Bits,
-
-    positions: #soa[dynamic]Position,
-    rotations: #soa[dynamic]Rotation,
-    velocities: #soa[dynamic]Velocity,
-}
-
-PCS :: struct {
-    Entity: Entity_Manager,
-    tags: [dynamic]Tag_Bits,
-
-    positions: #soa[dynamic]Position,
-    rotations: #soa[dynamic]Rotation,
-    velocities: #soa[dynamic]Velocity,
-}
-
-FCS :: struct {
-    Entity: Entity_Manager,
-}
-
-LCS :: struct {
-    Entity: Entity_Manager,
-}
-
-Entity_Manager :: struct {
-    entity_state: [dynamic]State,
-    free_entities: [dynamic]EntityID,
-    next_entity: EntityID,
+    entity_state: [dynamic]Entity_State,
+    free_entities: [dynamic]Entity,
+    next_entity: Entity,
     entity_capacity: int,
+    tags: [dynamic]Tag_Bits,
+
+    positions: #soa[dynamic]Position,
+    rotations: #soa[dynamic]Rotation,
+    velocities: #soa[dynamic]Velocity,
+
+    fused_grids: map[Entity]Fused_Grid,
 }
 
-EntityID :: distinct u32
-State :: enum {
+
+Entity :: distinct u32
+Entity_State :: enum {
     Dead,
     Alive,
 }
-
 Tag :: enum {
     Player,
     Human,
@@ -57,7 +33,6 @@ Tag :: enum {
 }
 Tag_Bits :: bit_set[Tag]
 
-
 Position :: struct {
     x, y, z: f32,
 }
@@ -67,13 +42,24 @@ Rotation :: struct {
 Velocity :: struct {
     x, y, z: f32,
 }
-
-
-System_Kind :: enum {
-    ECS,
-    PCS,
-    FCS,
-    LCS,
+Vector3 :: struct {
+    x, y, z: f32,
 }
 
+Fused_Grid :: struct {
+    dimensions: [3]u32,
+    occupancy: [dynamic]u64,
+}
+
+
+Cell_Coord :: struct {
+    x, y, z: i32,
+}
+Cell_Bucket :: struct {
+    entities: [dynamic]Entity,
+}
+Spatial_Index :: struct {
+    cell_size: u32,
+    cells: map[Cell_Coord]Cell_Bucket,
+}
 
