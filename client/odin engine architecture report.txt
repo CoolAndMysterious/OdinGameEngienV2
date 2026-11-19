@@ -1,0 +1,1077 @@
+# Odin Game Engine — Architecture and Project Handoff
+
+**Purpose:** Preserve the current project architecture, implementation status, design decisions, and planned development direction so work can continue in a new ChatGPT conversation without reconstructing the previous discussions.
+
+**Language:** Odin  
+**Rendering:** Raylib  
+**Current focus:** Unified ECS, entity lifecycle, spatial indexing, fused particle clusters, and eventually volumetric physics.
+
+---
+
+# 1. Project Overview
+
+The project is a game engine written in Odin.
+
+The long-term goal is to support a large, physically simulated world containing many kinds of matter:
+
+- Sand and other granular materials
+- Dirt and mud
+- Water and other liquids
+- Lava
+- Smoke and gases
+- Rock and other solid materials
+- Wood, leaves, grass and vegetation
+- Fused particle structures and larger physical objects
+
+The engine is intended to support large-scale procedural worlds and potentially multiplayer simulation.
+
+The physics model does not need to reproduce real-world physics exactly. Performance, scalability, and gameplay are more important than strict physical accuracy.
+
+A major architectural goal is to support individual particles as well as larger fused structures without requiring every particle inside a solid structure to be independently simulated at all times.
+
+The current project is being developed incrementally. Avoid introducing unnecessary abstractions or large architectural changes before they are needed.
+
+# 2. Current Project Files
+
+The following files were inspected.
+
+| File | Responsibility |
+|---|---|
+| `ECS_World(7).odin` | ECS data structures and type definitions |
+| `ECS_Functions(8).odin` | Entity lifecycle, storage growth, and tag operations |
+| `renderer(9).odin` | Raylib camera and rendering loop |
+| `main(7).odin` | Application entry point and main loop |
+
+## Current application entry point
+
+`main(7).odin` currently:
+
+- Prints a startup message.
+- Initializes a 1280 × 720 Raylib window.
+- Disables the cursor.
+- Declares an empty ECS instance.
+- Runs the rendering loop until the window closes.
+- Prints an exit message.
+
+The ECS is not yet initialized or used by the main loop.
+
+## Current renderer
+
+`renderer(9).odin` currently provides:
+
+- A global Raylib `Camera3D`.
+- An empty `Init` procedure.
+- An empty `Shutdown` procedure.
+- `RLrender`, which:
+  - Begins drawing.
+  - Clears the background.
+  - Updates the free camera.
+  - Draws a 3D grid.
+  - Displays FPS.
+  - Ends drawing.
+
+The cube rendering calls are currently commented out.
+
+Rendering and ECS functionality are not yet connected.
+
+# 3. Current ECS Architecture
+
+The engine has returned to a single unified ECS.
+
+An earlier approach involving four separate systems (ECS, PCS, FCS, and LCS) has been abandoned.
+
+There is one entity manager and one set of entity-indexed component arrays.
+
+## Current ECS structure
+
+```odin
+ECS :: struct {
+    entity_state: [dynamic]Entity_State,
+    free_entities: [dynamic]Entity,
+    next_entity: Entity,
+    entity_capacity: int,
+    tags: [dynamic]Tag_Bits,
+
+    positions: #soa[dynamic]Position,
+    rotations: #soa[dynamic]Rotation,
+    velocities: #soa[dynamic]Velocity,
+
+    fused_grids: map[Entity]Fused_Grid,
+}
+```
+
+The ECS stores:
+
+- Entity lifecycle information.
+- Reusable entity IDs.
+- Entity classification tags.
+- Position, rotation, and velocity components.
+- Fused particle grid data.
+
+The SOA arrays are indexed by Entity ID.
+
+An entity's component data is stored in one place. The spatial index must not duplicate position or velocity data.
+
+## Entity definitions
+
+```odin
+Entity :: distinct u32
+
+Entity_State :: enum {
+    Dead,
+    Alive,
+}
+```
+
+Entity IDs are distinct unsigned 32-bit integers.
+
+Entity state is stored separately in `entity_state`.
+
+There are no generation counters currently. Destroyed entity IDs are reused.
+
+## Tags
+
+```odin
+Tag :: enum {
+    Player,
+    Human,
+    AI,
+    Monster,
+    Particle,
+    Cluster,
+    FusedCluster,
+    Object,
+}
+
+Tag_Bits :: bit_set[Tag]
+```
+
+Tags are implemented using Odin's `bit_set`.
+
+They are intended for entity classification and determining what kind of entity is being simulated.
+
+Current tags distinguish:
+
+- Players
+- Humans
+- AI
+- Monsters
+- Individual particles
+- Clusters
+- Fused clusters
+- General objects
+
+The exact distinction between `Cluster` and `FusedCluster` remains to be finalized.
+
+Tags should not be repurposed to store arbitrary spatial coordinates or cell hashes.
+
+## Components
+
+```odin
+Position :: struct {
+    x, y, z: f32,
+}
+
+Rotation :: struct {
+    x, y, z, w: f32,
+}
+
+Velocity :: struct {
+    x, y, z: f32,
+}
+```
+
+Rotation uses a quaternion representation.
+
+New entities currently receive an identity quaternion by default:
+
+```odin
+{0, 0, 0, 1}
+```
+
+A separate `Vector3` type also exists:
+
+```odin
+Vector3 :: struct {
+    x, y, z: f32,
+}
+```
+
+It is currently defined but not used by the ECS implementation shown in the uploaded files.
+
+# 4. Entity Lifecycle
+
+The current entity lifecycle consists of:
+
+- `grow_entity_storage`
+- `create_entity`
+- `destroy_entity`
+- `add_tag`
+- `remove_tag`
+- `has_tag`
+
+All these functions operate on `^ECS` directly.
+
+There is no longer a `World` wrapper or `System_Kind` parameter in these functions.
+
+## 4.1 Storage growth
+
+Initial capacity is 1024 entities.
+
+When capacity is exhausted, it doubles:
+
+```text
+0 → 1024 → 2048 → 4096 → 8192 → ...
+```
+
+The entity-indexed arrays are:
+
+- `entity_state`
+- `tags`
+- `positions`
+- `rotations`
+- `velocities`
+
+Current implementation:
+
+```odin
+grow_entity_storage :: proc(ecs: ^ECS) -> bool {
+    old_capacity := ecs.entity_capacity
+
+    new_capacity := 1024
+    if old_capacity > 0 {
+        new_capacity = old_capacity * 2
+    }
+
+    // Reserve memory for every array first.
+    if reserve(&ecs.entity_state, new_capacity) != nil do return false
+    if reserve(&ecs.tags, new_capacity) != nil do return false
+
+    if reserve(&ecs.positions, new_capacity) != nil do return false
+    if reserve(&ecs.rotations, new_capacity) != nil do return false
+    if reserve(&ecs.velocities, new_capacity) != nil do return false
+
+    // All allocations succeeded. Now resize the arrays.
+    _ = resize(&ecs.entity_state, new_capacity)
+    _ = resize(&ecs.tags, new_capacity)
+
+    _ = resize(&ecs.positions, new_capacity)
+    _ = resize(&ecs.rotations, new_capacity)
+    _ = resize(&ecs.velocities, new_capacity)
+
+    ecs.entity_capacity = new_capacity
+    return true
+}
+```
+
+The intention is to reserve all arrays before changing their lengths.
+
+This prevents a failed allocation from leaving the ECS with some arrays at a new logical length and others at the old length.
+
+If a reservation fails, the function returns `false`. Some arrays might have larger allocated capacities, but their lengths remain unchanged.
+
+`entity_capacity` is only updated after all reservations and resizes succeed.
+
+The current implementation uses powers of two. Odin's current documentation notes that manually reserved SOA capacities can benefit from avoiding powers of two above 512 in some circumstances. This is a possible future optimization, not a reason to change the current implementation prematurely.
+
+## 4.2 Entity creation
+
+Current implementation:
+
+```odin
+create_entity :: proc(
+    ecs: ^ECS,
+    position: Position = {},
+    rotation: Rotation = {0, 0, 0, 1},
+    velocity: Velocity = {},
+) -> (Entity, bool) {
+
+    entity: Entity
+
+    // Reuse a destroyed entity ID first.
+    if len(ecs.free_entities) > 0 {
+        entity = pop(&ecs.free_entities)
+    } else {
+        entity = ecs.next_entity
+        id := int(entity)
+
+        // Grow storage if necessary.
+        if id >= ecs.entity_capacity {
+            if !grow_entity_storage(ecs) {
+                return {}, false
+            }
+        }
+
+        ecs.next_entity += 1
+    }
+
+    id := int(entity)
+
+    // Initialize entity.
+    ecs.entity_state[id] = .Alive
+    ecs.tags[id] = {}
+
+    // Initialize component data.
+    ecs.positions[id] = position
+    ecs.rotations[id] = rotation
+    ecs.velocities[id] = velocity
+
+    return entity, true
+}
+```
+
+Important behavior:
+
+1. Destroyed IDs are reused first.
+2. New IDs are allocated sequentially.
+3. Storage grows when needed.
+4. `next_entity` is only incremented after successful storage growth.
+5. Tags are reset when an entity is created.
+6. Position, rotation, and velocity are overwritten on every creation, including ID reuse.
+
+Default values:
+
+| Component | Default |
+|---|---|
+| Position | `{0, 0, 0}` |
+| Rotation | `{0, 0, 0, 1}` |
+| Velocity | `{0, 0, 0}` |
+| Tags | Empty |
+
+The reason for overwriting all three components is to prevent reused entity IDs from inheriting stale data from previously destroyed entities.
+
+The function returns `(Entity, bool)` so callers can detect allocation failure.
+
+Example:
+
+```odin
+entity, success := create_entity(&ecs)
+```
+
+With initial values:
+
+```odin
+entity, success := create_entity(
+    &ecs,
+    position = {100, 50, 20},
+    velocity = {0, 10, 0},
+)
+```
+
+## 4.3 Entity destruction
+
+Current implementation:
+
+```odin
+destroy_entity :: proc(ecs: ^ECS, entity: Entity) {
+    id := int(entity)
+
+    assert(
+        id >= 0 && id < len(ecs.entity_state),
+        "Invalid entity ID",
+    )
+
+    assert(
+        ecs.entity_state[id] == .Alive,
+        "Entity is already dead",
+    )
+
+    // Mark entity as dead.
+    // Remove every tag from this entity.
+    // Make the ID available for reuse.
+    ecs.entity_state[id] = .Dead
+    ecs.tags[id] = {}
+    append(&ecs.free_entities, entity)
+}
+```
+
+Important decisions:
+
+- Mark the entity dead.
+- Clear all tags.
+- Add the ID to the free-entity stack.
+- Do not clear position, rotation, or velocity.
+- The next entity creation overwrites those components.
+
+The current function does not yet remove spatial-index membership or fused-grid data.
+
+These need to be addressed when the relevant systems are implemented.
+
+## 4.4 Tag operations
+
+Current implementations:
+
+```odin
+add_tag :: proc(ecs: ^ECS, entity: Entity, tag: Tag) {
+    id := int(entity)
+
+    assert(
+        id >= 0 && id < len(ecs.entity_state),
+        "Invalid entity ID",
+    )
+
+    assert(
+        ecs.entity_state[id] == .Alive,
+        "Entity is dead",
+    )
+
+    ecs.tags[id] += {tag}
+}
+```
+
+```odin
+remove_tag :: proc(ecs: ^ECS, entity: Entity, tag: Tag) {
+    id := int(entity)
+
+    assert(
+        id >= 0 && id < len(ecs.entity_state),
+        "Invalid entity ID",
+    )
+
+    assert(
+        ecs.entity_state[id] == .Alive,
+        "Entity is dead",
+    )
+
+    ecs.tags[id] -= {tag}
+}
+```
+
+```odin
+has_tag :: proc(ecs: ^ECS, entity: Entity, tag: Tag) -> bool {
+    id := int(entity)
+
+    if id < 0 || id >= len(ecs.entity_state) {
+        return false
+    }
+
+    if ecs.entity_state[id] != .Alive {
+        return false
+    }
+
+    return tag in ecs.tags[id]
+}
+```
+
+These operations use Odin's native bit-set operators.
+
+No additional abstraction is currently necessary.
+
+# 5. Fused Particle / Cluster Representation
+
+The engine is intended to support particle fusion.
+
+A large solid object does not need to simulate every constituent particle individually while it remains fused.
+
+Instead, a fused structure is represented by:
+
+- One ECS entity.
+- One position and rotation.
+- One fused-grid data entry.
+
+The current structure is:
+
+```odin
+Fused_Grid :: struct {
+    dimensions: [3]u32,
+    occupancy: [dynamic]u64,
+}
+```
+
+The ECS owns:
+
+```odin
+fused_grids: map[Entity]Fused_Grid
+```
+
+The map is keyed by Entity ID.
+
+A fused-grid entry exists only for entities that own fused-grid data.
+
+## 5.1 Occupancy grid
+
+The occupancy grid is a dense bit grid.
+
+It records which particle locations exist inside a fused structure.
+
+Each bit represents one particle location:
+
+- Set bit: particle exists.
+- Unset bit: particle does not exist.
+
+The dimensions describe the grid dimensions along X, Y, and Z.
+
+The occupancy data is stored in `u64` words.
+
+This is intended to be a compact representation of the fused structure's particle composition.
+
+The grid is not a second set of ECS entities. While fused, its constituent particles are not independently represented as active entities.
+
+## 5.2 Why fused grids use a map
+
+Not every entity owns a fused grid.
+
+Using a map avoids allocating a large fused-grid descriptor for every entity.
+
+The key is the owner entity:
+
+```odin
+fused_grids: map[Entity]Fused_Grid
+```
+
+The occupancy array is dynamically allocated for each fused entity.
+
+When deleting a fused structure, its occupancy allocation must be explicitly freed before removing the map entry.
+
+# 6. Planned Cluster Lifecycle
+
+The cluster lifecycle is a planned feature. It is not implemented in the uploaded files yet.
+
+The intended design uses dedicated cluster functions built on top of the existing entity functions.
+
+The important principle is that cluster operations should reuse the existing ECS entity lifecycle rather than duplicate it.
+
+## 6.1 Create cluster
+
+A future function:
+
+```odin
+create_cluster :: proc(...)
+```
+
+The likely workflow:
+
+1. Create an ECS entity using `create_entity`.
+2. Assign the appropriate cluster tag.
+3. Allocate and initialize its `Fused_Grid`.
+4. Insert the grid into `ecs.fused_grids`, keyed by the new entity ID.
+5. Return the cluster entity ID.
+
+The cluster entity owns the fused-grid data.
+
+The function may eventually accept an existing entity ID or create a new entity itself. The exact API is not finalized.
+
+The preferred approach currently is to reuse `create_entity` inside `create_cluster`.
+
+## 6.2 Fracture cluster
+
+A future function:
+
+```odin
+fracture_cluster :: proc(...)
+```
+
+The intended workflow:
+
+1. Receive the original cluster entity.
+2. Read its dimensions and occupancy bit grid.
+3. Decode the occupancy grid.
+4. Calculate how the original cluster separates into disconnected or otherwise distinct pieces.
+5. Determine the resulting fragments.
+6. Delete the original cluster and its fused-grid data.
+7. Create replacement entities for the resulting fragments.
+
+For fragments containing multiple particles:
+
+- Create a new cluster.
+- Allocate a new occupancy grid.
+- Store the fragment's particle occupancy.
+- Assign the appropriate cluster tag.
+
+For a fragment containing exactly one particle:
+
+- Do not create a cluster.
+- Create an ordinary particle entity.
+- Assign its Particle tag.
+- Give it the appropriate world position and physical state.
+
+This avoids representing a single particle as a cluster.
+
+The fracture algorithm itself has not been selected or implemented.
+
+Potential future considerations include:
+
+- Connectivity testing.
+- Fragment separation.
+- Reconstructing fragment-local coordinates.
+- Calculating fragment positions.
+- Assigning velocities to fragments.
+- Preserving mass and particle count.
+
+These are future design tasks, not current implemented behavior.
+
+## 6.3 Delete cluster
+
+A future function:
+
+```odin
+delete_cluster :: proc(...)
+```
+
+This differs from ordinary entity destruction.
+
+A cluster owns dynamically allocated fused-grid data, so deleting it must also remove that data.
+
+The intended workflow:
+
+1. Validate the cluster entity.
+2. Find its fused-grid entry.
+3. Delete the occupancy dynamic array.
+4. Remove the map entry.
+5. Destroy the ECS entity using `destroy_entity`.
+
+The exact order and error-handling policy will be established when implementing the cluster functions.
+
+Ordinary `destroy_entity` should remain a generic entity-lifecycle function. Cluster-specific cleanup belongs in `delete_cluster`.
+
+# 7. Spatial Index Architecture
+
+A spatial index has been designed but is not yet integrated into the current ECS implementation.
+
+The current definitions in `ECS_World(7).odin` are:
+
+```odin
+Cell_Coord :: struct {
+    x, y, z: i32,
+}
+
+Cell_Bucket :: struct {
+    entities: [dynamic]Entity,
+}
+
+Spatial_Index :: struct {
+    cell_size: u32,
+    cells: map[Cell_Coord]Cell_Bucket,
+}
+```
+
+The spatial index is intended to accelerate physical queries.
+
+It is not a second ECS and must not duplicate entity positions, velocities, tags, or other physical data.
+
+## 7.1 What it indexes
+
+The index should contain all physical entities, not just individual particles.
+
+Examples:
+
+- Loose sand particles.
+- Water particles.
+- Smoke particles.
+- Loose rock fragments.
+- Fused rock structures.
+- Fused particle clusters.
+- Players.
+- Other physical objects.
+
+An entity that is visual-only or does not participate in physical simulation does not need to be indexed.
+
+A fused cluster is indexed as one physical entity. Its internal particles are not separately indexed while fused.
+
+## 7.2 Cell coordinates
+
+The spatial index uses signed integer coordinates:
+
+```odin
+Cell_Coord :: struct {
+    x, y, z: i32,
+}
+```
+
+The cell size is an unsigned integer:
+
+```odin
+cell_size: u32
+```
+
+The cell coordinate is calculated from the entity's world position:
+
+```text
+Cell_X = floor(Position.X / Cell_Size)
+Cell_Y = floor(Position.Y / Cell_Size)
+Cell_Z = floor(Position.Z / Cell_Size)
+```
+
+Floor is necessary for correct negative world coordinates.
+
+The initial cell size is expected to be configurable, with 1 world unit considered as a starting experiment. This is not a proven optimum.
+
+## 7.3 Cell buckets
+
+Each cell contains a dynamic array of Entity IDs.
+
+```odin
+Cell_Bucket :: struct {
+    entities: [dynamic]Entity,
+}
+```
+
+The map connects cell coordinates to their buckets:
+
+```odin
+cells: map[Cell_Coord]Cell_Bucket
+```
+
+The spatial index stores entity references only.
+
+When the physics system queries a cell, it retrieves Entity IDs and accesses their actual components through the ECS.
+
+## 7.4 Spatial index ownership
+
+The spatial index is intended to be runtime data, separate from the persistent ECS.
+
+The current ECS structure does not contain a `Spatial_Index` field.
+
+It should eventually belong to a physics/runtime context.
+
+The intended lifecycle:
+
+1. Load persistent ECS data.
+2. Initialize the spatial index.
+3. Calculate the cell coordinate for each physical entity.
+4. Insert each entity into the corresponding bucket.
+5. Run the simulation.
+6. Update bucket membership when entities cross cell boundaries.
+7. Discard the index when the runtime context is destroyed.
+
+The spatial index is reconstructible from ECS positions and physical classification.
+
+It should not be necessary to save the index to disk.
+
+## 7.5 Updating the index
+
+The initial design uses incremental updates.
+
+When an entity moves:
+
+1. Calculate its old cell from its previous position.
+2. Calculate its new cell from its new position.
+3. If the cells are different, remove its ID from the old bucket.
+4. Insert its ID into the new bucket.
+
+We deliberately do not want additional ECS arrays storing cell coordinates or linked-list relationships for every entity.
+
+The old and new positions are sufficient to calculate the cell transition.
+
+All entity movement paths, teleports, creation, destruction, and fracture operations must eventually maintain index membership correctly.
+
+## 7.6 Differently sized entities
+
+A future problem is that physical entities have different sizes.
+
+A large rock might overlap several cells even though its center belongs to only one cell.
+
+Possible future solutions:
+
+- Insert an entity into every cell its bounding box overlaps.
+- Keep large objects in a separate structure.
+- Introduce a hierarchical grid or octree.
+- Investigate adaptive spatial partitioning.
+
+The first implementation should remain simple. A single hash grid is preferred initially.
+
+## 7.7 Spatial query and physics
+
+The spatial index only finds nearby entities.
+
+It does not determine how those entities interact.
+
+The physics simulation will:
+
+1. Query the relevant cell and neighbouring cells.
+2. Retrieve nearby entity IDs.
+3. Read their positions and tags.
+4. Determine the appropriate material/entity interaction.
+5. Calculate forces, collisions, or positional corrections.
+6. Apply the result.
+
+Tags are used for classification, not spatial storage.
+
+# 8. Physics Architecture and Design Decisions
+
+The physics system is intended to handle all physical matter.
+
+The simulation should support:
+
+- Particle collisions.
+- Granular material behavior.
+- Fluid-like behavior.
+- Gas and smoke behavior.
+- Solid objects.
+- Fused structures.
+- Fracture and recombination.
+
+## 8.1 No permanent particle joints
+
+The decision is to avoid persistent particle-to-particle joint or bond records.
+
+A rock does not need its internal particles to remain individually active or connected through permanent records.
+
+While fused, it is represented as a fused structure.
+
+The physics system evaluates interactions dynamically using nearby entities discovered through the spatial index.
+
+No permanent generic particle-neighbour database is wanted.
+
+## 8.2 Contacts versus persistent relationships
+
+The simulation should calculate current interactions from nearby entities.
+
+Examples:
+
+- Sand and sand: granular collision and friction.
+- Water and water: fluid interaction.
+- Water and rock: collision and flow around the surface.
+- Smoke and smoke: gas-like interaction.
+- Player and rock: physical collision.
+
+These are temporary physical interactions, not permanent joints.
+
+The user does not currently want a separate persistent physics-joint array.
+
+## 8.3 Sleeping and activity states
+
+Sleeping or inactive particle optimization has been discussed but is not implemented.
+
+The general intention is to avoid continuously simulating stable objects that are not being disturbed.
+
+However, sleeping logic will be designed later.
+
+A sleeping entity must eventually be woken when disturbed by another entity, an explosion, digging, fracture, or another physical event.
+
+Do not add a `Particle_Activity` array prematurely.
+
+## 8.4 Environmental fields
+
+Environmental fields were considered, including:
+
+- Gravity.
+- Temperature.
+- Sunlight.
+- Radiation.
+
+A separate `Environment_Field` and `Environment_Index` were briefly proposed.
+
+The decision was to drop environmental field structures for now.
+
+Do not add them to the ECS or spatial index at this stage.
+
+Gravity may eventually be calculated using GPU compute shaders. CPU/server-side authoritative simulation and GPU availability will need consideration later.
+
+The immediate priority is particle combining, fracture, collision, and flowing behavior.
+
+# 9. Memory and Storage Principles
+
+The engine is intended to support enormous worlds, so memory efficiency matters.
+
+Current principles:
+
+- Avoid duplicating ECS component data.
+- Avoid unnecessary per-entity arrays.
+- Use SOA for entity-indexed position, rotation, and velocity.
+- Use maps for optional per-entity data such as fused grids.
+- Use dense occupancy bit grids for fused structures.
+- Use a spatial index containing Entity IDs rather than copied components.
+- Keep reconstructible runtime caches separate from persistent world state.
+
+A rough spatial-index estimate previously considered approximately 15 MB for one million entities under a favorable bucket distribution. This is an estimate, not a measured benchmark, and actual memory depends heavily on occupied-cell count, allocator overhead, and bucket allocation strategy.
+
+A future optimization may replace one dynamic array allocation per cell with a flat Entity ID pool and bucket ranges.
+
+Do not prematurely implement that optimization.
+
+# 10. Persistence and Memory Management
+
+The ECS represents persistent world state.
+
+The entity IDs, capacity, entity states, tags, components, and fused-grid data are part of the world state that must be saved.
+
+The spatial index is runtime-only and reconstructible.
+
+A previous discussion considered an ECS `shutdown` function.
+
+The current conclusion is that a dedicated ECS shutdown function is not necessary if the ECS remains alive for the entire application lifetime and is only discarded when the process exits.
+
+The operating system reclaims process memory on termination.
+
+Odin itself does not automatically manage dynamic arrays or maps while the application is running. Explicit deletion is necessary when allocations are deliberately released during runtime.
+
+Fused-grid occupancy arrays must be explicitly deleted if a fused structure is removed during runtime.
+
+Cluster-specific cleanup should be implemented in `delete_cluster`.
+
+# 11. Current Implementation Status
+
+## Implemented in uploaded files
+
+- Unified ECS structure.
+- Entity ID and state types.
+- Tag enum and bit-set representation.
+- Position, rotation, and velocity components.
+- Fused-grid data structure.
+- Fused-grid map in ECS.
+- Cell coordinate, bucket, and spatial-index type definitions.
+- Entity storage growth.
+- Entity creation with optional initial component values.
+- Entity ID reuse.
+- Entity destruction.
+- Tag addition, removal, and checking.
+- Basic Raylib renderer.
+- Main application loop.
+
+## Defined but not operational
+
+- Fused-grid storage and occupancy representation.
+- Spatial-index types.
+- Cluster tags.
+- Runtime world physics architecture.
+
+## Not implemented yet
+
+- Cluster creation.
+- Cluster deletion.
+- Cluster fracture.
+- Connectivity/fracture algorithm.
+- Particle fusion algorithm.
+- Particle-to-cluster conversion.
+- Cluster-to-particle conversion.
+- Spatial-index initialization and population.
+- Spatial-index insertion/removal.
+- Spatial-index update when entities move.
+- Neighbour-cell queries.
+- Physics collision and interaction solver.
+- Fluid simulation.
+- Granular simulation.
+- Sleeping/waking.
+- Save/load implementation.
+- Environmental simulation.
+- GPU compute physics.
+- Multiplayer/server simulation.
+
+# 12. Important Outstanding Implementation Considerations
+
+These are not reasons to redesign the current architecture. They are issues to address when implementing the relevant functions.
+
+## 12.1 Storage growth
+
+The current growth function reserves all arrays before resizing them.
+
+It ignores the return values of `resize` after successful reservations. The intention is that those resizes will not require additional allocation because sufficient capacity has already been reserved.
+
+This should be verified against the current Odin compiler and allocator behavior.
+
+## 12.2 Entity ID range
+
+`Entity` is `distinct u32`, while `entity_capacity` and array lengths use `int`.
+
+Entity ID exhaustion and conversion limits have not yet been handled.
+
+## 12.3 Entity destruction
+
+The generic `destroy_entity` currently does not know about cluster-specific data or spatial-index membership.
+
+Cluster cleanup belongs in a cluster-specific function.
+
+Spatial-index removal will need to be integrated when the index is implemented.
+
+## 12.4 Cluster tags
+
+The distinction between `Cluster` and `FusedCluster` is not finalized.
+
+Do not assume their semantics without discussing them.
+
+## 12.5 Spatial index for large objects
+
+A single-center-cell insertion strategy may miss large overlapping objects.
+
+The first implementation should establish the basic grid and query behavior, then address object extents.
+
+## 12.6 Save format
+
+The ECS is persistent, but no current save implementation appears in the uploaded files.
+
+The save format should preserve the actual world state, not temporary spatial-index membership.
+
+# 13. Recommended Development Order
+
+The following order keeps implementation incremental.
+
+### Stage 1 — Finish ECS lifecycle
+
+- Verify current entity creation.
+- Verify storage growth.
+- Verify entity destruction and ID reuse.
+- Verify tags.
+- Add tests for capacity growth and entity reuse.
+
+### Stage 2 — Implement fused-grid basics
+
+- Create a fused grid.
+- Store dimensions and occupancy.
+- Set and query occupancy bits.
+- Delete fused-grid data correctly.
+
+### Stage 3 — Implement cluster lifecycle
+
+- `create_cluster`
+- `delete_cluster`
+- Basic cluster validation.
+
+Reuse the generic `create_entity` and `destroy_entity` functions wherever appropriate.
+
+### Stage 4 — Implement fracture
+
+- Decode occupancy.
+- Find disconnected fragments.
+- Generate new cluster grids for multi-particle fragments.
+- Generate ordinary Particle entities for single-particle fragments.
+- Remove the original cluster.
+
+### Stage 5 — Implement runtime spatial indexing
+
+- Initialize spatial index.
+- Insert physical entities.
+- Remove physical entities.
+- Update cell membership.
+- Query neighbouring cells.
+
+### Stage 6 — Implement physical interactions
+
+- Collision detection.
+- Particle-particle interactions.
+- Material-specific behavior.
+- Granular settling.
+- Fluid-like behavior.
+
+### Stage 7 — Optimize
+
+- Profile memory.
+- Profile spatial queries.
+- Investigate flat bucket storage.
+- Investigate adaptive spatial partitioning.
+- Introduce sleeping/waking.
+
+---
+
+# 14. Instructions for the Next ChatGPT Conversation
+
+Continue from the architecture and actual code described in this document.
+
+Important working preferences:
+
+1. Work incrementally, one function or design decision at a time.
+2. Preserve existing code unless a change is necessary.
+3. Do not redesign functions unnecessarily.
+4. Do not introduce extra arrays or abstractions without a concrete reason.
+5. Do not reintroduce the abandoned four-subsystem ECS architecture.
+6. Do not introduce persistent particle joints or permanent particle-neighbour records.
+7. Do not add environmental fields yet.
+8. Keep the spatial index separate from persistent ECS data.
+9. Use the existing tags for classification.
+10. Use the existing `create_entity` function when building higher-level entity operations such as clusters.
+11. Verify current Odin syntax and APIs rather than guessing.
+12. When the user requests a complete function, provide the complete function using the current project types and signatures.
+13. Clearly distinguish implemented code from proposed architecture.
+14. Avoid overengineering. The user prefers simple, memory-conscious solutions that can be optimized later.
+
+**Immediate next architectural task:** Design and implement the cluster lifecycle, beginning with `create_cluster`, while preserving the existing unified ECS and fused-grid representation.
