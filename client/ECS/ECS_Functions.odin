@@ -109,3 +109,46 @@ has_tag :: proc(ecs: ^ECS, entity: Entity, tag: Tag) -> bool {
 
     return tag in ecs.tags[id]
 }
+
+
+
+update_scene_view :: proc( ecs: ^ECS, scene: ^Scene, camera_position: Position, radius: f32, ) -> bool {
+
+    // Clear previous entities, retaining allocated capacity.
+    clear(&scene.sdf)
+
+    radius_squared := radius * radius
+
+    // Iterate over every allocated entity ID.
+    for id in 0..<int(ecs.next_entity) {
+
+        // Ignore dead entities.
+        if ecs.entity_state[id] != .Alive {
+            continue
+        }
+
+        // Only collect Particle-tagged entities.
+        if Tag.Particle not_in ecs.tags[id] {
+            continue
+        }
+
+        position := ecs.positions[id]
+
+        // Calculate squared distance from camera.
+        dx := position.x - camera_position.x
+        dy := position.y - camera_position.y
+        dz := position.z - camera_position.z
+
+        distance_squared :=
+            dx * dx +
+            dy * dy +
+            dz * dz
+
+        // Check whether the particle is inside the radius.
+        if distance_squared <= radius_squared {
+            append(&scene.sdf, Entity(id))
+        }
+    }
+
+    return true
+}

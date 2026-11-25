@@ -15,6 +15,10 @@ ECS :: struct {
     fused_grids: map[Entity]Fused_Grid,
 }
 
+Scene :: struct {
+    sdf: [dynamic]Entity,
+}
+
 
 Entity :: distinct u32
 Entity_State :: enum {
