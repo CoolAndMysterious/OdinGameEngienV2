@@ -35,7 +35,7 @@ const float SDF_RADIUS     = 0.05;
 const float HIT_THRESHOLD  = 0.001;
 const float NORMAL_EPSILON = 0.001;
 const float MAX_DISTANCE   = 100.0;
-const int MAX_STEPS        = 128;
+const int MAX_STEPS        = 64;
 
 // Raylib's default perspective clipping planes.
 const float NEAR_PLANE = 0.01;
@@ -54,39 +54,26 @@ float sdSphere(vec3 p, vec3 center)
 // Scene SDF
 // -----------------------------------------------------------------------------
 
-float sceneSDF(vec3 p)
+float sceneSDF(vec3 p, out vec3 nearestCenter)
 {
-    float d = 1e20;
+    float bestD2 = 1e30;
+    nearestCenter = vec3(0.0);
 
     for (uint i = 0u; i < sphere_count; ++i)
     {
-        d = min(d, sdSphere(p, positions[i].xyz));
+        vec3 delta = p - positions[i].xyz;
+        float d2 = dot(delta, delta);
+
+        if (d2 < bestD2)
+        {
+            bestD2 = d2;
+            nearestCenter = positions[i].xyz;
+        }
     }
 
-    return d;
+    return sqrt(bestD2) - SDF_RADIUS;
 }
 
-// -----------------------------------------------------------------------------
-// Normal
-// -----------------------------------------------------------------------------
-
-vec3 calcNormal(vec3 p)
-{
-    float e = NORMAL_EPSILON;
-
-    vec3 gradient = vec3(
-        sceneSDF(p + vec3(e, 0.0, 0.0)) -
-        sceneSDF(p - vec3(e, 0.0, 0.0)),
-
-        sceneSDF(p + vec3(0.0, e, 0.0)) -
-        sceneSDF(p - vec3(0.0, e, 0.0)),
-
-        sceneSDF(p + vec3(0.0, 0.0, e)) -
-        sceneSDF(p - vec3(0.0, 0.0, e))
-    );
-
-    return normalize(gradient);
-}
 
 // -----------------------------------------------------------------------------
 // Ray direction
@@ -164,10 +151,10 @@ void main()
 
     for (int step = 0; step < MAX_STEPS; ++step)
     {
-        vec3 position =
-            rayOrigin + rayDirection * rayDistance;
+        vec3 position = rayOrigin + rayDirection * rayDistance;
 
-        float distanceToScene = sceneSDF(position);
+        vec3 nearestCenter;
+        float distanceToScene = sceneSDF(position, nearestCenter);
 
         if (distanceToScene < HIT_THRESHOLD)
         {
@@ -187,7 +174,7 @@ void main()
                 discard;
             }
 
-            vec3 normal = calcNormal(position);
+            vec3 normal = normalize(position - nearestCenter);
             vec3 color = shadeSurface(position, normal);
 
             finalColor = vec4(color, 1.0);
