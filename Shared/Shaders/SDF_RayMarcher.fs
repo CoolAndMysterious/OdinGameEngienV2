@@ -1,12 +1,11 @@
 
 #version 430 core
 
-in vec2 fragTexCoord;
 out vec4 finalColor;
 
 // -----------------------------------------------------------------------------
-// SDF scene buffer
-// CPU layout: four f32 values per entity.
+// ECS SDF scene
+// CPU uploads four f32 values per entity:
 // xyz = position, w = unused.
 // -----------------------------------------------------------------------------
 
@@ -19,18 +18,14 @@ uniform uint sphere_count;
 
 // -----------------------------------------------------------------------------
 // Camera
+// cam_dir length = 1 / tan(vertical FOV / 2)
 // -----------------------------------------------------------------------------
 
 uniform vec3 cam_pos;
-uniform vec3 cam_right;
+uniform vec3 cam_dir;
 uniform vec3 cam_up;
-uniform vec3 cam_forward;
 
-uniform vec2 tan_fov;
-uniform vec2 resolution;
-
-uniform mat4 view_matrix;
-uniform mat4 proj_matrix;
+uniform vec2 screen_center;
 
 // -----------------------------------------------------------------------------
 // SDF settings
@@ -41,6 +36,10 @@ const float HIT_THRESHOLD  = 0.001;
 const float NORMAL_EPSILON = 0.001;
 const float MAX_DISTANCE   = 100.0;
 const int MAX_STEPS        = 128;
+
+// Raylib's default perspective clipping planes.
+const float NEAR_PLANE = 0.01;
+const float FAR_PLANE  = 1000.0;
 
 // -----------------------------------------------------------------------------
 // Sphere SDF
@@ -68,7 +67,7 @@ float sceneSDF(vec3 p)
 }
 
 // -----------------------------------------------------------------------------
-// Surface normal
+// Normal
 // -----------------------------------------------------------------------------
 
 vec3 calcNormal(vec3 p)
@@ -90,25 +89,43 @@ vec3 calcNormal(vec3 p)
 }
 
 // -----------------------------------------------------------------------------
-// Camera ray
+// Ray direction
 // -----------------------------------------------------------------------------
 
 vec3 getRayDirection()
 {
-    // Convert pixel coordinates to centered NDC coordinates.
-    // NDC ranges from -1 to +1 on both axes.
-    vec2 uv = gl_FragCoord.xy / resolution;
-    vec2 ndc = uv * 2.0 - 1.0;
+    // Screen coordinates centered around the screen center.
+    // Dividing both axes by screen height accounts for aspect ratio.
 
-    // tan_fov.x = tan(vertical FOV / 2) * aspect ratio
-    // tan_fov.y = tan(vertical FOV / 2)
-    //
-    // This matches the FOV calculation in renderer.odin.
+    vec2 nCoord =
+        (gl_FragCoord.xy - screen_center) / screen_center.y;
 
+    vec3 forward = normalize(cam_dir);
+
+    // Construct an orthogonal camera basis.
+    vec3 right = normalize(cross(forward, cam_up));
+    vec3 up    = normalize(cross(right, forward));
+
+    // cam_dir magnitude carries the vertical FOV.
     return normalize(
-        cam_forward
-        + cam_right * ndc.x * tan_fov.x
-        + cam_up    * ndc.y * tan_fov.y
+        cam_dir
+        + right * nCoord.x
+        + up    * nCoord.y
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Project raymarch distance into conventional OpenGL depth.
+// -----------------------------------------------------------------------------
+
+float calcDepth(vec3 rd, float distanceAlongRay)
+{
+    float localZ = dot(normalize(cam_dir), rd) * distanceAlongRay;
+
+    return (
+        (1.0 / localZ) - (1.0 / NEAR_PLANE)
+    ) / (
+        (1.0 / FAR_PLANE) - (1.0 / NEAR_PLANE)
     );
 }
 
@@ -135,7 +152,6 @@ vec3 shadeSurface(vec3 position, vec3 normal)
 
 void main()
 {
-    // No SDF entities: preserve the raster pixel.
     if (sphere_count == 0u)
     {
         discard;
@@ -148,30 +164,25 @@ void main()
 
     for (int step = 0; step < MAX_STEPS; ++step)
     {
-        vec3 position = rayOrigin + rayDirection * rayDistance;
+        vec3 position =
+            rayOrigin + rayDirection * rayDistance;
 
         float distanceToScene = sceneSDF(position);
 
-        // Surface hit.
         if (distanceToScene < HIT_THRESHOLD)
         {
-            // Transform the world-space hit into clip space.
-            vec4 clipPosition =
-                proj_matrix *
-                view_matrix *
-                vec4(position, 1.0);
+            float viewDistance =
+                dot(normalize(cam_dir), rayDirection) * rayDistance;
 
-            if (clipPosition.w <= 0.0)
+            // Outside the camera clipping range.
+            if (viewDistance <= NEAR_PLANE)
             {
                 discard;
             }
 
-            float ndcDepth = clipPosition.z / clipPosition.w;
+            float depth = calcDepth(rayDirection, rayDistance);
 
-            // OpenGL NDC depth [-1, 1] to window depth [0, 1].
-            float hitDepth = ndcDepth * 0.5 + 0.5;
-
-            if (hitDepth < 0.0 || hitDepth > 1.0)
+            if (depth < 0.0 || depth > 1.0)
             {
                 discard;
             }
@@ -181,13 +192,12 @@ void main()
 
             finalColor = vec4(color, 1.0);
 
-            // Write the raymarched surface depth.
-            gl_FragDepth = hitDepth;
+            // Write SDF surface depth into the shared framebuffer.
+            gl_FragDepth = depth;
 
             return;
         }
 
-        // Sphere tracing step.
         rayDistance += max(
             distanceToScene,
             HIT_THRESHOLD * 0.5
@@ -199,6 +209,6 @@ void main()
         }
     }
 
-    // Miss: preserve the raster color and depth.
+    // Miss: leave the framebuffer unchanged.
     discard;
 }
